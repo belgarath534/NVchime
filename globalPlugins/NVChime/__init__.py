@@ -1,7 +1,16 @@
 """
 NVChime - Custom NVDA Startup Sound Addon
 Author: Leo
-Version: 1.1
+Version: 2.0.0
+
+Features:
+- Built-in sound pack + community pack import
+- Random sound mode
+- Custom sound with user-defined label
+- Schedule mode (time of day)
+- Day of week mode
+- Startup and exit sounds
+- Adjustable delay
 """
 
 import globalPluginHandler
@@ -13,21 +22,49 @@ import os
 import threading
 import time
 import nvwave
+import datetime
+import zipfile
+import shutil
 
 addonHandler.initTranslation()
 
 confspec = {
-    "mode": "string(default='pack')",
+    # Startup
+    "mode": "string(default='pack')",          # pack, custom, random, schedule, disabled
     "packSound": "string(default='chime')",
     "customPath": "string(default='')",
+    "customLabel": "string(default='My Sound')",
+    "delayMs": "integer(default=1200, min=0, max=5000)",
+
+    # Exit
     "exitMode": "string(default='disabled')",
     "exitPackSound": "string(default='chime')",
     "exitCustomPath": "string(default='')",
-    "delayMs": "integer(default=1200, min=0, max=5000)",
+    "exitCustomLabel": "string(default='My Sound')",
+
+    # Schedule mode
+    "schedMorningSound": "string(default='chime')",
+    "schedMorningStart": "integer(default=6)",
+    "schedAfternoonSound": "string(default='retro')",
+    "schedAfternoonStart": "integer(default=12)",
+    "schedEveningSound": "string(default='chill')",
+    "schedEveningStart": "integer(default=18)",
+    "schedNightSound": "string(default='soft')",
+    "schedNightStart": "integer(default=22)",
+
+    # Day of week overrides (0=Mon ... 6=Sun), empty string means no override
+    "dowMonday": "string(default='')",
+    "dowTuesday": "string(default='')",
+    "dowWednesday": "string(default='')",
+    "dowThursday": "string(default='')",
+    "dowFriday": "string(default='dramatic')",
+    "dowSaturday": "string(default='horror')",
+    "dowSunday": "string(default='')",
 }
 config.conf.spec["NVChime"] = confspec
 
-SOUND_PACK = {
+# Built-in pack
+BUILTIN_PACK = {
     "chime": "Classic Chime",
     "retro": "Retro Beep",
     "soft": "Soft Bell",
@@ -36,16 +73,91 @@ SOUND_PACK = {
     "chill": "Chill Tone",
 }
 
+DOW_KEYS = ["dowMonday", "dowTuesday", "dowWednesday", "dowThursday", "dowFriday", "dowSaturday", "dowSunday"]
+DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-def get_sounds_dir():
+
+def get_addon_path():
     for addon in addonHandler.getRunningAddons():
         if addon.manifest["name"] == "nvChime":
-            return os.path.join(addon.path, "sounds")
-    return os.path.join(os.path.dirname(__file__), "..", "sounds")
+            return addon.path
+    return os.path.join(os.path.dirname(__file__), "..")
 
 
-def get_pack_sound_path(sound_id):
-    return os.path.join(get_sounds_dir(), sound_id + ".wav")
+def get_sounds_dir():
+    return os.path.join(get_addon_path(), "sounds")
+
+
+def get_packs_dir():
+    """Community packs stored in addon/packs/"""
+    path = os.path.join(get_addon_path(), "packs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_all_sounds():
+    """Returns dict of sound_id -> display_name from built-in + all imported packs."""
+    sounds = dict(BUILTIN_PACK)
+    packs_dir = get_packs_dir()
+    for pack_folder in os.listdir(packs_dir):
+        pack_path = os.path.join(packs_dir, pack_folder)
+        ini_path = os.path.join(pack_path, "pack.ini")
+        if os.path.isdir(pack_path) and os.path.isfile(ini_path):
+            try:
+                import configparser
+                cp = configparser.ConfigParser()
+                cp.read(ini_path)
+                pack_name = cp.get("pack", "name", fallback=pack_folder)
+                for key, val in cp.items("sounds"):
+                    full_key = f"{pack_folder}/{key}"
+                    sounds[full_key] = f"{val} ({pack_name})"
+            except Exception:
+                pass
+    return sounds
+
+
+def get_sound_path(sound_id):
+    """Resolve a sound_id to an absolute WAV path."""
+    if "/" in sound_id:
+        # Community pack sound
+        pack_folder, sound_name = sound_id.split("/", 1)
+        return os.path.join(get_packs_dir(), pack_folder, sound_name + ".wav")
+    else:
+        return os.path.join(get_sounds_dir(), sound_id + ".wav")
+
+
+def pick_random_sound():
+    sounds = get_all_sounds()
+    import random
+    sound_id = random.choice(list(sounds.keys()))
+    return sound_id
+
+
+def pick_schedule_sound():
+    now = datetime.datetime.now()
+    hour = now.hour
+    dow = now.weekday()  # 0=Mon, 6=Sun
+
+    # Check day-of-week override first
+    dow_key = DOW_KEYS[dow]
+    dow_override = config.conf["NVChime"][dow_key]
+    if dow_override:
+        return dow_override
+
+    # Schedule by time of day
+    night_start = config.conf["NVChime"]["schedNightStart"]
+    evening_start = config.conf["NVChime"]["schedEveningStart"]
+    afternoon_start = config.conf["NVChime"]["schedAfternoonStart"]
+    morning_start = config.conf["NVChime"]["schedMorningStart"]
+
+    if hour >= night_start or hour < morning_start:
+        return config.conf["NVChime"]["schedNightSound"]
+    elif hour >= evening_start:
+        return config.conf["NVChime"]["schedEveningSound"]
+    elif hour >= afternoon_start:
+        return config.conf["NVChime"]["schedAfternoonSound"]
+    else:
+        return config.conf["NVChime"]["schedMorningSound"]
 
 
 def play_sound(path, delay_ms=0):
@@ -53,19 +165,32 @@ def play_sound(path, delay_ms=0):
         try:
             if delay_ms > 0:
                 time.sleep(delay_ms / 1000.0)
-            # Use AudioPurpose.SOUNDS for newer NVDA versions
-            try:
-                nvwave.playWaveFile(path, asynchronous=True, isSpeechWaveFileCommand=False)
-            except TypeError:
-                # Older NVDA versions don't have those params
-                nvwave.playWaveFile(path)
-        except Exception as e:
-            import ui
-            try:
-                ui.message(f"NVChime error: {str(e)}")
-            except Exception:
-                pass
+            nvwave.playWaveFile(path)
+        except Exception:
+            pass
     threading.Thread(target=_play, daemon=True).start()
+
+
+def resolve_and_play(mode, pack_sound, custom_path, delay_ms=0):
+    if mode == "disabled":
+        return
+    elif mode == "pack":
+        path = get_sound_path(pack_sound)
+        if os.path.isfile(path):
+            play_sound(path, delay_ms)
+    elif mode == "custom":
+        if custom_path and os.path.isfile(custom_path):
+            play_sound(custom_path, delay_ms)
+    elif mode == "random":
+        sound_id = pick_random_sound()
+        path = get_sound_path(sound_id)
+        if os.path.isfile(path):
+            play_sound(path, delay_ms)
+    elif mode == "schedule":
+        sound_id = pick_schedule_sound()
+        path = get_sound_path(sound_id)
+        if os.path.isfile(path):
+            play_sound(path, delay_ms)
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -73,32 +198,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(NVChimeSettingsPanel)
-        self._triggerSound("startup")
-
-    def _triggerSound(self, event):
-        if event == "startup":
-            mode = config.conf["NVChime"]["mode"]
-            pack_key = config.conf["NVChime"]["packSound"]
-            custom_path = config.conf["NVChime"]["customPath"]
-            delay = config.conf["NVChime"]["delayMs"]
-        else:
-            mode = config.conf["NVChime"]["exitMode"]
-            pack_key = config.conf["NVChime"]["exitPackSound"]
-            custom_path = config.conf["NVChime"]["exitCustomPath"]
-            delay = 0
-
-        if mode == "disabled":
-            return
-        elif mode == "pack":
-            path = get_pack_sound_path(pack_key)
-            if os.path.isfile(path):
-                play_sound(path, delay_ms=delay)
-        elif mode == "custom":
-            if custom_path and os.path.isfile(custom_path):
-                play_sound(custom_path, delay_ms=delay)
+        resolve_and_play(
+            config.conf["NVChime"]["mode"],
+            config.conf["NVChime"]["packSound"],
+            config.conf["NVChime"]["customPath"],
+            config.conf["NVChime"]["delayMs"],
+        )
 
     def terminate(self):
-        self._triggerSound("exit")
+        resolve_and_play(
+            config.conf["NVChime"]["exitMode"],
+            config.conf["NVChime"]["exitPackSound"],
+            config.conf["NVChime"]["exitCustomPath"],
+            0,
+        )
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.remove(NVChimeSettingsPanel)
         super().terminate()
 
@@ -108,23 +221,24 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
 
     def makeSettings(self, sizer):
         helper = gui.guiHelper.BoxSizerHelper(self, sizer=sizer)
+        self._allSounds = get_all_sounds()
+        self._soundIds = list(self._allSounds.keys())
+        self._soundNames = list(self._allSounds.values())
 
+        MODES = ["Pack sound", "Custom WAV", "Random", "Schedule", "Disabled"]
+        MODE_KEYS = ["pack", "custom", "random", "schedule", "disabled"]
+
+        # ── STARTUP ──
         helper.addItem(wx.StaticText(self, label="Startup Sound"))
-        self.modeChoice = helper.addLabeledControl(
-            "Startup sound mode:",
-            wx.Choice,
-            choices=["Play a sound from the pack", "Play my own WAV file", "Disabled"],
-        )
-        modeMap = {"pack": 0, "custom": 1, "disabled": 2}
-        self.modeChoice.SetSelection(modeMap.get(config.conf["NVChime"]["mode"], 0))
+
+        self.modeChoice = helper.addLabeledControl("Mode:", wx.Choice, choices=MODES)
+        modeIdx = MODE_KEYS.index(config.conf["NVChime"]["mode"]) if config.conf["NVChime"]["mode"] in MODE_KEYS else 0
+        self.modeChoice.SetSelection(modeIdx)
         self.modeChoice.Bind(wx.EVT_CHOICE, self._onModeChange)
 
-        packIds = list(SOUND_PACK.keys())
-        self.packChoice = helper.addLabeledControl(
-            "Pack sound:", wx.Choice, choices=list(SOUND_PACK.values()),
-        )
+        self.packChoice = helper.addLabeledControl("Pack sound:", wx.Choice, choices=self._soundNames)
         currentPack = config.conf["NVChime"]["packSound"]
-        self.packChoice.SetSelection(packIds.index(currentPack) if currentPack in packIds else 0)
+        self.packChoice.SetSelection(self._soundIds.index(currentPack) if currentPack in self._soundIds else 0)
 
         customSizer = wx.BoxSizer(wx.HORIZONTAL)
         self.customPathField = wx.TextCtrl(self, value=config.conf["NVChime"]["customPath"])
@@ -134,24 +248,22 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         customSizer.Add(self.browseBtn)
         helper.addItem(customSizer)
 
+        self.customLabel = helper.addLabeledControl("Custom sound label:", wx.TextCtrl, value=config.conf["NVChime"]["customLabel"])
+
         self.previewStartBtn = helper.addItem(wx.Button(self, label="Preview Startup Sound"))
         self.previewStartBtn.Bind(wx.EVT_BUTTON, self._onPreviewStart)
 
+        # ── EXIT ──
         helper.addItem(wx.StaticText(self, label="Exit Sound"))
-        self.exitModeChoice = helper.addLabeledControl(
-            "Exit sound mode:",
-            wx.Choice,
-            choices=["Play a sound from the pack", "Play my own WAV file", "Disabled"],
-        )
-        exitModeMap = {"pack": 0, "custom": 1, "disabled": 2}
-        self.exitModeChoice.SetSelection(exitModeMap.get(config.conf["NVChime"]["exitMode"], 2))
+
+        self.exitModeChoice = helper.addLabeledControl("Exit mode:", wx.Choice, choices=MODES)
+        exitModeIdx = MODE_KEYS.index(config.conf["NVChime"]["exitMode"]) if config.conf["NVChime"]["exitMode"] in MODE_KEYS else 4
+        self.exitModeChoice.SetSelection(exitModeIdx)
         self.exitModeChoice.Bind(wx.EVT_CHOICE, self._onModeChange)
 
-        self.exitPackChoice = helper.addLabeledControl(
-            "Exit pack sound:", wx.Choice, choices=list(SOUND_PACK.values()),
-        )
-        currentExitPack = config.conf["NVChime"]["exitPackSound"]
-        self.exitPackChoice.SetSelection(packIds.index(currentExitPack) if currentExitPack in packIds else 0)
+        self.exitPackChoice = helper.addLabeledControl("Exit pack sound:", wx.Choice, choices=self._soundNames)
+        currentExit = config.conf["NVChime"]["exitPackSound"]
+        self.exitPackChoice.SetSelection(self._soundIds.index(currentExit) if currentExit in self._soundIds else 0)
 
         exitCustomSizer = wx.BoxSizer(wx.HORIZONTAL)
         self.exitCustomPathField = wx.TextCtrl(self, value=config.conf["NVChime"]["exitCustomPath"])
@@ -161,9 +273,45 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         exitCustomSizer.Add(self.exitBrowseBtn)
         helper.addItem(exitCustomSizer)
 
+        self.exitCustomLabel = helper.addLabeledControl("Exit custom sound label:", wx.TextCtrl, value=config.conf["NVChime"]["exitCustomLabel"])
+
         self.previewExitBtn = helper.addItem(wx.Button(self, label="Preview Exit Sound"))
         self.previewExitBtn.Bind(wx.EVT_BUTTON, self._onPreviewExit)
 
+        # ── SCHEDULE ──
+        helper.addItem(wx.StaticText(self, label="Schedule Mode Settings"))
+
+        periods = [
+            ("Morning", "schedMorningSound", "schedMorningStart"),
+            ("Afternoon", "schedAfternoonSound", "schedAfternoonStart"),
+            ("Evening", "schedEveningSound", "schedEveningStart"),
+            ("Night", "schedNightSound", "schedNightStart"),
+        ]
+        self._schedSoundChoices = {}
+        self._schedStartSpinners = {}
+        for period_name, sound_key, start_key in periods:
+            choice = helper.addLabeledControl(f"{period_name} sound:", wx.Choice, choices=self._soundNames)
+            current = config.conf["NVChime"][sound_key]
+            choice.SetSelection(self._soundIds.index(current) if current in self._soundIds else 0)
+            self._schedSoundChoices[sound_key] = choice
+
+            spinner = helper.addLabeledControl(f"{period_name} starts at hour (0-23):", wx.SpinCtrl, min=0, max=23, initial=config.conf["NVChime"][start_key])
+            self._schedStartSpinners[start_key] = spinner
+
+        # ── DAY OF WEEK ──
+        helper.addItem(wx.StaticText(self, label="Day of Week Overrides (leave blank for no override)"))
+        self._dowChoices = {}
+        dow_options = ["(No override)"] + self._soundNames
+        for dow_key, dow_name in zip(DOW_KEYS, DOW_NAMES):
+            choice = helper.addLabeledControl(f"{dow_name}:", wx.Choice, choices=dow_options)
+            current = config.conf["NVChime"][dow_key]
+            if current and current in self._soundIds:
+                choice.SetSelection(self._soundIds.index(current) + 1)
+            else:
+                choice.SetSelection(0)
+            self._dowChoices[dow_key] = choice
+
+        # ── DELAY ──
         helper.addItem(wx.StaticText(self, label="Timing"))
         self.delaySpinner = helper.addLabeledControl(
             "Startup delay in milliseconds:", wx.SpinCtrl,
@@ -171,8 +319,13 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
             initial=config.conf["NVChime"]["delayMs"],
         )
 
+        # ── IMPORT PACK ──
+        helper.addItem(wx.StaticText(self, label="Community Sound Packs"))
+        self.importBtn = helper.addItem(wx.Button(self, label="Import Sound Pack (.nvchime-pack)"))
+        self.importBtn.Bind(wx.EVT_BUTTON, self._onImportPack)
 
         self._updateVisibility()
+
     def _onModeChange(self, event):
         self._updateVisibility()
 
@@ -181,56 +334,74 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         self.packChoice.Show(startSel == 0)
         self.customPathField.Show(startSel == 1)
         self.browseBtn.Show(startSel == 1)
-        self.previewStartBtn.Show(startSel != 2)
+        self.customLabel.Show(startSel == 1)
+        self.previewStartBtn.Show(startSel != 4)
 
         exitSel = self.exitModeChoice.GetSelection()
         self.exitPackChoice.Show(exitSel == 0)
         self.exitCustomPathField.Show(exitSel == 1)
         self.exitBrowseBtn.Show(exitSel == 1)
-        self.previewExitBtn.Show(exitSel != 2)
+        self.exitCustomLabel.Show(exitSel == 1)
+        self.previewExitBtn.Show(exitSel != 4)
+
         self.Layout()
 
     def _onBrowse(self, targetField):
-        with wx.FileDialog(
-            self, message="Choose a WAV file",
-            wildcard="WAV files (*.wav)|*.wav",
-            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
-        ) as dlg:
+        with wx.FileDialog(self, message="Choose a WAV file", wildcard="WAV files (*.wav)|*.wav", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 targetField.SetValue(dlg.GetPath())
 
+    def _onImportPack(self, event):
+        with wx.FileDialog(self, message="Choose a sound pack", wildcard="NVChime packs (*.nvchime-pack)|*.nvchime-pack", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            pack_file = dlg.GetPath()
+
+        try:
+            packs_dir = get_packs_dir()
+            pack_name = os.path.splitext(os.path.basename(pack_file))[0]
+            dest = os.path.join(packs_dir, pack_name)
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+            with zipfile.ZipFile(pack_file, "r") as z:
+                z.extractall(dest)
+            gui.messageBox(f"Sound pack '{pack_name}' imported successfully! Restart NVChime settings to see new sounds.", "NVChime", wx.OK | wx.ICON_INFORMATION)
+        except Exception as e:
+            gui.messageBox(f"Failed to import pack:\n{str(e)}", "NVChime Import Error", wx.OK | wx.ICON_ERROR)
+
     def _onPreviewStart(self, event):
-        self._previewSound(self.modeChoice, self.packChoice, self.customPathField)
+        MODE_KEYS = ["pack", "custom", "random", "schedule", "disabled"]
+        mode = MODE_KEYS[self.modeChoice.GetSelection()]
+        pack_id = self._soundIds[self.packChoice.GetSelection()]
+        custom_path = self.customPathField.GetValue()
+        resolve_and_play(mode, pack_id, custom_path, 0)
 
     def _onPreviewExit(self, event):
-        self._previewSound(self.exitModeChoice, self.exitPackChoice, self.exitCustomPathField)
-
-    def _previewSound(self, modeCtrl, packCtrl, pathCtrl):
-        packIds = list(SOUND_PACK.keys())
-        sel = modeCtrl.GetSelection()
-        if sel == 0:
-            path = get_pack_sound_path(packIds[packCtrl.GetSelection()])
-        elif sel == 1:
-            path = pathCtrl.GetValue()
-        else:
-            gui.messageBox("Sound is set to Disabled.", "NVChime", wx.OK | wx.ICON_INFORMATION)
-            return
-
-        if path and os.path.isfile(path):
-            play_sound(path, delay_ms=0)
-        else:
-            gui.messageBox(
-                f"Sound file not found:\n{path}",
-                "NVChime Preview Error", wx.OK | wx.ICON_ERROR,
-            )
+        MODE_KEYS = ["pack", "custom", "random", "schedule", "disabled"]
+        mode = MODE_KEYS[self.exitModeChoice.GetSelection()]
+        pack_id = self._soundIds[self.exitPackChoice.GetSelection()]
+        custom_path = self.exitCustomPathField.GetValue()
+        resolve_and_play(mode, pack_id, custom_path, 0)
 
     def onSave(self):
-        packIds = list(SOUND_PACK.keys())
-        modeMap = {0: "pack", 1: "custom", 2: "disabled"}
-        config.conf["NVChime"]["mode"] = modeMap[self.modeChoice.GetSelection()]
-        config.conf["NVChime"]["packSound"] = packIds[self.packChoice.GetSelection()]
+        MODE_KEYS = ["pack", "custom", "random", "schedule", "disabled"]
+
+        config.conf["NVChime"]["mode"] = MODE_KEYS[self.modeChoice.GetSelection()]
+        config.conf["NVChime"]["packSound"] = self._soundIds[self.packChoice.GetSelection()]
         config.conf["NVChime"]["customPath"] = self.customPathField.GetValue()
-        config.conf["NVChime"]["exitMode"] = modeMap[self.exitModeChoice.GetSelection()]
-        config.conf["NVChime"]["exitPackSound"] = packIds[self.exitPackChoice.GetSelection()]
-        config.conf["NVChime"]["exitCustomPath"] = self.exitCustomPathField.GetValue()
+        config.conf["NVChime"]["customLabel"] = self.customLabel.GetValue()
         config.conf["NVChime"]["delayMs"] = self.delaySpinner.GetValue()
+
+        config.conf["NVChime"]["exitMode"] = MODE_KEYS[self.exitModeChoice.GetSelection()]
+        config.conf["NVChime"]["exitPackSound"] = self._soundIds[self.exitPackChoice.GetSelection()]
+        config.conf["NVChime"]["exitCustomPath"] = self.exitCustomPathField.GetValue()
+        config.conf["NVChime"]["exitCustomLabel"] = self.exitCustomLabel.GetValue()
+
+        for sound_key, choice in self._schedSoundChoices.items():
+            config.conf["NVChime"][sound_key] = self._soundIds[choice.GetSelection()]
+        for start_key, spinner in self._schedStartSpinners.items():
+            config.conf["NVChime"][start_key] = spinner.GetValue()
+
+        for dow_key, choice in self._dowChoices.items():
+            sel = choice.GetSelection()
+            config.conf["NVChime"][dow_key] = self._soundIds[sel - 1] if sel > 0 else ""
