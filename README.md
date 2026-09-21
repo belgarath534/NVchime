@@ -1,14 +1,16 @@
 # NVChime
 
-An NVDA add-on that customizes your NVDA startup and exit sounds. Choose from a built-in sound pack, import community packs, use your own WAV file, set a startup delay, and use schedule or random mode.
+An NVDA add-on that customizes your NVDA startup and exit sounds. Choose from a built-in sound pack, import community packs, use your own WAV file, set a startup delay, control volume, set silent hours, and use schedule or random mode.
 
 ## Features
 
-- Random mode: plays a different sound every time NVDA starts
+- Random mode: plays a different sound every time NVDA starts, never the same one twice in a row
 - Schedule mode: different sounds based on time of day (morning, afternoon, evening, night)
 - Day of week overrides: special sounds for specific days
 - Custom sound label: give your custom WAV a friendly name
 - Community sound pack import (`.nvchime-pack` files)
+- Per-event volume control for startup and exit sounds
+- Silent Hours: a do-not-disturb window where no sound plays
 
 ## Sound Modes
 
@@ -16,7 +18,7 @@ An NVDA add-on that customizes your NVDA startup and exit sounds. Choose from a 
 |---|---|
 | Pack sound | Choose from the built-in sound pack |
 | Custom WAV | Use any WAV file from your computer |
-| Random | Plays a random sound from all available sounds |
+| Random | Plays a random sound from all available sounds, never the same one twice in a row |
 | Schedule | Different sounds for morning, afternoon, evening, and night |
 | Disabled | No sound |
 

@@ -1,16 +1,18 @@
 """
 NVChime - Custom NVDA Startup Sound Addon
 Author: Leo
-Version: 2.0.0
+Version: 2.1.0
 
 Features:
 - Built-in sound pack + community pack import
-- Random sound mode
+- Random sound mode (no-repeat)
 - Custom sound with user-defined label
 - Schedule mode (time of day)
 - Day of week mode
 - Startup and exit sounds
 - Adjustable delay
+- Per-event volume control
+- Silent hours (do-not-disturb window)
 """
 
 import globalPluginHandler
@@ -25,6 +27,9 @@ import nvwave
 import datetime
 import zipfile
 import shutil
+import wave
+import array
+import tempfile
 
 addonHandler.initTranslation()
 
@@ -35,12 +40,14 @@ confspec = {
     "customPath": "string(default='')",
     "customLabel": "string(default='My Sound')",
     "delayMs": "integer(default=1200, min=0, max=5000)",
+    "startupVolume": "integer(default=100, min=0, max=100)",
 
     # Exit
     "exitMode": "string(default='disabled')",
     "exitPackSound": "string(default='chime')",
     "exitCustomPath": "string(default='')",
     "exitCustomLabel": "string(default='My Sound')",
+    "exitVolume": "integer(default=100, min=0, max=100)",
 
     # Schedule mode
     "schedMorningSound": "string(default='chime')",
@@ -60,6 +67,11 @@ confspec = {
     "dowFriday": "string(default='dramatic')",
     "dowSaturday": "string(default='horror')",
     "dowSunday": "string(default='')",
+
+    # Silent hours (do-not-disturb window; no startup/exit sound plays during this range)
+    "silentHoursEnabled": "boolean(default=False)",
+    "silentHoursStart": "integer(default=22, min=0, max=23)",
+    "silentHoursEnd": "integer(default=7, min=0, max=23)",
 }
 config.conf.spec["NVChime"] = confspec
 
@@ -126,10 +138,18 @@ def get_sound_path(sound_id):
         return os.path.join(get_sounds_dir(), sound_id + ".wav")
 
 
+_last_random_sound = None
+
+
 def pick_random_sound():
+    global _last_random_sound
     sounds = get_all_sounds()
+    ids = list(sounds.keys())
     import random
-    sound_id = random.choice(list(sounds.keys()))
+    if len(ids) > 1 and _last_random_sound in ids:
+        ids = [sid for sid in ids if sid != _last_random_sound]
+    sound_id = random.choice(ids)
+    _last_random_sound = sound_id
     return sound_id
 
 
@@ -160,37 +180,76 @@ def pick_schedule_sound():
         return config.conf["NVChime"]["schedMorningSound"]
 
 
-def play_sound(path, delay_ms=0):
+def apply_volume(src_path, volume_percent, cache_key):
+    """Returns a path to play at the given volume (0-100). Scales 16-bit PCM
+    WAV samples into a cached temp file; falls back to the original file for
+    other formats or on any error."""
+    if volume_percent >= 100:
+        return src_path
+    try:
+        with wave.open(src_path, "rb") as w:
+            params = w.getparams()
+            frames = w.readframes(w.getnframes())
+        if params.sampwidth != 2:
+            return src_path
+        samples = array.array("h", frames)
+        factor = max(0, min(100, volume_percent)) / 100.0
+        for i in range(len(samples)):
+            samples[i] = int(samples[i] * factor)
+        out_path = os.path.join(tempfile.gettempdir(), f"nvchime_{cache_key}.wav")
+        with wave.open(out_path, "wb") as out:
+            out.setparams(params)
+            out.writeframes(samples.tobytes())
+        return out_path
+    except Exception:
+        return src_path
+
+
+def play_sound(path, delay_ms=0, volume_percent=100, cache_key="tmp"):
     def _play():
         try:
             if delay_ms > 0:
                 time.sleep(delay_ms / 1000.0)
-            nvwave.playWaveFile(path)
+            playPath = apply_volume(path, volume_percent, cache_key)
+            nvwave.playWaveFile(playPath)
         except Exception:
             pass
     threading.Thread(target=_play, daemon=True).start()
 
 
-def resolve_and_play(mode, pack_sound, custom_path, delay_ms=0):
+def in_silent_hours():
+    if not config.conf["NVChime"]["silentHoursEnabled"]:
+        return False
+    start = config.conf["NVChime"]["silentHoursStart"]
+    end = config.conf["NVChime"]["silentHoursEnd"]
+    hour = datetime.datetime.now().hour
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def resolve_and_play(mode, pack_sound, custom_path, delay_ms=0, volume_percent=100, cache_key="tmp"):
     if mode == "disabled":
         return
     elif mode == "pack":
         path = get_sound_path(pack_sound)
         if os.path.isfile(path):
-            play_sound(path, delay_ms)
+            play_sound(path, delay_ms, volume_percent, cache_key)
     elif mode == "custom":
         if custom_path and os.path.isfile(custom_path):
-            play_sound(custom_path, delay_ms)
+            play_sound(custom_path, delay_ms, volume_percent, cache_key)
     elif mode == "random":
         sound_id = pick_random_sound()
         path = get_sound_path(sound_id)
         if os.path.isfile(path):
-            play_sound(path, delay_ms)
+            play_sound(path, delay_ms, volume_percent, cache_key)
     elif mode == "schedule":
         sound_id = pick_schedule_sound()
         path = get_sound_path(sound_id)
         if os.path.isfile(path):
-            play_sound(path, delay_ms)
+            play_sound(path, delay_ms, volume_percent, cache_key)
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -198,20 +257,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(NVChimeSettingsPanel)
-        resolve_and_play(
-            config.conf["NVChime"]["mode"],
-            config.conf["NVChime"]["packSound"],
-            config.conf["NVChime"]["customPath"],
-            config.conf["NVChime"]["delayMs"],
-        )
+        if not in_silent_hours():
+            resolve_and_play(
+                config.conf["NVChime"]["mode"],
+                config.conf["NVChime"]["packSound"],
+                config.conf["NVChime"]["customPath"],
+                config.conf["NVChime"]["delayMs"],
+                config.conf["NVChime"]["startupVolume"],
+                "startup",
+            )
 
     def terminate(self):
-        resolve_and_play(
-            config.conf["NVChime"]["exitMode"],
-            config.conf["NVChime"]["exitPackSound"],
-            config.conf["NVChime"]["exitCustomPath"],
-            0,
-        )
+        if not in_silent_hours():
+            resolve_and_play(
+                config.conf["NVChime"]["exitMode"],
+                config.conf["NVChime"]["exitPackSound"],
+                config.conf["NVChime"]["exitCustomPath"],
+                0,
+                config.conf["NVChime"]["exitVolume"],
+                "exit",
+            )
         gui.settingsDialogs.NVDASettingsDialog.categoryClasses.remove(NVChimeSettingsPanel)
         super().terminate()
 
@@ -250,6 +315,11 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
 
         self.customLabel = helper.addLabeledControl("Custom sound label:", wx.TextCtrl, value=config.conf["NVChime"]["customLabel"])
 
+        self.startupVolume = helper.addLabeledControl(
+            "Volume (%):", wx.SpinCtrl, min=0, max=100,
+            initial=config.conf["NVChime"]["startupVolume"],
+        )
+
         self.previewStartBtn = helper.addItem(wx.Button(self, label="Preview Startup Sound"))
         self.previewStartBtn.Bind(wx.EVT_BUTTON, self._onPreviewStart)
 
@@ -274,6 +344,11 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         helper.addItem(exitCustomSizer)
 
         self.exitCustomLabel = helper.addLabeledControl("Exit custom sound label:", wx.TextCtrl, value=config.conf["NVChime"]["exitCustomLabel"])
+
+        self.exitVolume = helper.addLabeledControl(
+            "Volume (%):", wx.SpinCtrl, min=0, max=100,
+            initial=config.conf["NVChime"]["exitVolume"],
+        )
 
         self.previewExitBtn = helper.addItem(wx.Button(self, label="Preview Exit Sound"))
         self.previewExitBtn.Bind(wx.EVT_BUTTON, self._onPreviewExit)
@@ -317,6 +392,20 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
             "Startup delay in milliseconds:", wx.SpinCtrl,
             min=0, max=5000,
             initial=config.conf["NVChime"]["delayMs"],
+        )
+
+        # ── SILENT HOURS ──
+        helper.addItem(wx.StaticText(self, label="Silent Hours"))
+        self.silentHoursEnabled = helper.addItem(wx.CheckBox(self, label="Enable silent hours (no startup or exit sound during this window)"))
+        self.silentHoursEnabled.SetValue(config.conf["NVChime"]["silentHoursEnabled"])
+
+        self.silentHoursStart = helper.addLabeledControl(
+            "Silent from hour (0-23):", wx.SpinCtrl, min=0, max=23,
+            initial=config.conf["NVChime"]["silentHoursStart"],
+        )
+        self.silentHoursEnd = helper.addLabeledControl(
+            "Silent until hour (0-23):", wx.SpinCtrl, min=0, max=23,
+            initial=config.conf["NVChime"]["silentHoursEnd"],
         )
 
         # ── IMPORT PACK ──
@@ -374,14 +463,14 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         mode = MODE_KEYS[self.modeChoice.GetSelection()]
         pack_id = self._soundIds[self.packChoice.GetSelection()]
         custom_path = self.customPathField.GetValue()
-        resolve_and_play(mode, pack_id, custom_path, 0)
+        resolve_and_play(mode, pack_id, custom_path, 0, self.startupVolume.GetValue(), "preview_startup")
 
     def _onPreviewExit(self, event):
         MODE_KEYS = ["pack", "custom", "random", "schedule", "disabled"]
         mode = MODE_KEYS[self.exitModeChoice.GetSelection()]
         pack_id = self._soundIds[self.exitPackChoice.GetSelection()]
         custom_path = self.exitCustomPathField.GetValue()
-        resolve_and_play(mode, pack_id, custom_path, 0)
+        resolve_and_play(mode, pack_id, custom_path, 0, self.exitVolume.GetValue(), "preview_exit")
 
     def onSave(self):
         MODE_KEYS = ["pack", "custom", "random", "schedule", "disabled"]
@@ -391,11 +480,13 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         config.conf["NVChime"]["customPath"] = self.customPathField.GetValue()
         config.conf["NVChime"]["customLabel"] = self.customLabel.GetValue()
         config.conf["NVChime"]["delayMs"] = self.delaySpinner.GetValue()
+        config.conf["NVChime"]["startupVolume"] = self.startupVolume.GetValue()
 
         config.conf["NVChime"]["exitMode"] = MODE_KEYS[self.exitModeChoice.GetSelection()]
         config.conf["NVChime"]["exitPackSound"] = self._soundIds[self.exitPackChoice.GetSelection()]
         config.conf["NVChime"]["exitCustomPath"] = self.exitCustomPathField.GetValue()
         config.conf["NVChime"]["exitCustomLabel"] = self.exitCustomLabel.GetValue()
+        config.conf["NVChime"]["exitVolume"] = self.exitVolume.GetValue()
 
         for sound_key, choice in self._schedSoundChoices.items():
             config.conf["NVChime"][sound_key] = self._soundIds[choice.GetSelection()]
@@ -405,3 +496,7 @@ class NVChimeSettingsPanel(gui.settingsDialogs.SettingsPanel):
         for dow_key, choice in self._dowChoices.items():
             sel = choice.GetSelection()
             config.conf["NVChime"][dow_key] = self._soundIds[sel - 1] if sel > 0 else ""
+
+        config.conf["NVChime"]["silentHoursEnabled"] = self.silentHoursEnabled.GetValue()
+        config.conf["NVChime"]["silentHoursStart"] = self.silentHoursStart.GetValue()
+        config.conf["NVChime"]["silentHoursEnd"] = self.silentHoursEnd.GetValue()
